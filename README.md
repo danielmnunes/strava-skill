@@ -19,11 +19,16 @@ Detalhes em [`skills/strava/references/setup.md`](skills/strava/references/setup
 
 ## Uso
 
-Depois de instalada, peça ao agente, por exemplo: "resuma meus treinos da última semana" ou "qual meu pace médio de corrida este mês?".
+Depois de instalada, peça ao agente, por exemplo: "resuma meus treinos da última semana", "mostre meus treinos de corrida de setembro" ou "quantos km já fiz com meus tênis?".
+
+Ferramentas cobertas (via API v3): `eligibility`, `health`, `get_athlete_profile`, `list_activities`, `get_activity_performance`, `get_activity_streams`, `get_athlete_zones`, `get_gear`, `get_club_info`.
+
+**Não suportado** (a API pública do Strava não expõe): plano de treino, detalhes de treino de força, foco de treino, zonas de ritmo e eventos de clube.
 
 O script também funciona sozinho (Python 3, só stdlib):
 
 ```bash
+python3 skills/strava/scripts/strava.py list_activities --json '{"first":10,"ordering":"StartDateLocalDesc"}'
 python3 skills/strava/scripts/strava.py activities --after 30d --type Run --compact
 ```
 

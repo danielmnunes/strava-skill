@@ -2,7 +2,23 @@
 
 Base: `https://www.strava.com/api/v3` · Docs: https://developers.strava.com/docs/reference/
 
-## Endpoints usados
+## Ferramentas → endpoints
+
+| Ferramenta | Endpoints v3 | Observações |
+|---|---|---|
+| `eligibility` | `GET /athlete` | Calculada localmente: `summit`/`premium` + escopos concedidos |
+| `health` | `GET /athlete` | Inclui uso do rate limit (headers) |
+| `get_athlete_profile` | `GET /athlete` | Sem foco de treino |
+| `list_activities` | `GET /athlete/activities` | Filtro/ordenação/cursor aplicados no cliente sobre `start_date_local`; `relative_effort` = `suffer_score` |
+| `get_activity_performance` | `GET /activities/{id}`, `/activities/{id}/laps` | |
+| `get_activity_streams` | `GET /activities/{id}/streams` | `resolution` = downsample no cliente |
+| `get_athlete_zones` | `GET /athlete/zones` | Só FC e potência, valores atuais |
+| `get_gear` | `GET /athlete`, `GET /gear/{id}`, fallback `gear_id` das atividades | Tipo pelo prefixo do id (`b` bike, `g` tênis) |
+| `get_club_info` | `GET /athlete/clubs`, `GET /clubs/{id}` | Sem eventos |
+
+Sem equivalente na v3: plano de treino, treino de força (exercícios/séries), foco de treino, zonas de ritmo, eventos de clube.
+
+## Endpoints usados (baixo nível)
 
 | Comando | Endpoint | Escopo |
 |---|---|---|

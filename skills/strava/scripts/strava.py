@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 API_BASE = os.environ.get("STRAVA_API_BASE", "https://www.strava.com/api/v3").rstrip("/")
@@ -136,12 +136,18 @@ def refresh(creds):
     save_creds(persistable(creds))
 
 
+LAST_RATE = {}
+
+
 def check_rate_limit(headers):
     try:
         limit = [int(x) for x in headers.get("X-RateLimit-Limit", "").split(",")]
         usage = [int(x) for x in headers.get("X-RateLimit-Usage", "").split(",")]
     except ValueError:
         return
+    if len(limit) == 2 and len(usage) == 2:
+        LAST_RATE.update({"limit_15min": limit[0], "limit_day": limit[1],
+                          "usage_15min": usage[0], "usage_day": usage[1]})
     for name, lim, use in zip(("15min", "dia"), limit, usage):
         if lim and use / lim >= 0.8:
             print(f"[aviso] rate limit ({name}): {use}/{lim}", file=sys.stderr)
@@ -414,6 +420,311 @@ def cmd_raw(args):
     return api_get(path, params)
 
 
+# ---------- ferramentas (mesmos nomes/parâmetros do conector Strava) ----------
+# Cobrem apenas o que a API v3 oferece; parâmetros sem suporte são ignorados com aviso em "notes".
+
+STREAM_ALIASES = {
+    "heart_rate": "heartrate", "speed": "velocity_smooth", "gps": "latlng", "power": "watts",
+    "temperature": "temp", "elevation": "altitude", "grade": "grade_smooth",
+}
+GEAR_PREFIX_TYPE = {"b": "Bike", "g": "Shoe"}
+
+
+def tool_params(args, allowed, ignored=()):
+    p = {}
+    if args.json:
+        raw = sys.stdin.read() if args.json == "-" else args.json
+        try:
+            p = json.loads(raw)
+        except ValueError as e:
+            raise StravaError(f"--json inválido: {e}")
+        if not isinstance(p, dict):
+            raise StravaError("--json deve ser um objeto")
+    for kv in args.param or []:
+        k, sep, v = kv.partition("=")
+        if not sep:
+            raise StravaError(f"--param deve ser k=v (recebido {kv!r})")
+        try:
+            v = json.loads(v)
+        except ValueError:
+            pass
+        p[k] = v
+    unknown = [k for k in p if k not in allowed and k not in ignored]
+    if unknown:
+        raise StravaError(f"Parâmetros desconhecidos: {unknown}. Aceitos: {sorted(allowed)}")
+    notes = [f"'{k}' não é suportado pela API v3 do Strava e foi ignorado" for k in ignored if k in p]
+    return p, notes
+
+
+def need(p, key):
+    if p.get(key) in (None, ""):
+        raise StravaError(f"Parâmetro obrigatório ausente: {key}")
+    return str(p[key])
+
+
+def as_int(p, key, default, lo=1, hi=200):
+    try:
+        v = int(p.get(key, default))
+    except (TypeError, ValueError):
+        raise StravaError(f"{key} deve ser inteiro")
+    return max(lo, min(hi, v))
+
+
+def as_bool(v):
+    return v is True or str(v).lower() in ("1", "true", "yes", "sim")
+
+
+def tool(fn, allowed, ignored=()):
+    def handler(args):
+        p, notes = tool_params(args, allowed, ignored)
+        out = fn(p)
+        if notes:
+            out = {**out, "notes": notes}
+        return out
+    return handler
+
+
+def granted_scopes(creds):
+    return [s for s in (creds.get("scope") or "").replace(" ", ",").split(",") if s]
+
+
+def t_eligibility(p):
+    creds = load_creds()
+    if not creds.get("refresh_token"):
+        return {"eligible": False, "reason": "not_authenticated", "detail": "Rode: strava.py auth"}
+    a = api_get("/athlete", creds=creds)
+    subscriber = bool(a.get("summit") or a.get("premium"))
+    scopes = granted_scopes(creds)
+    missing = [s for s in REQUIRED_SCOPES if s not in scopes]
+    reason = "ok" if subscriber and not missing else ("not_subscriber" if not subscriber else "missing_scopes")
+    return {"eligible": subscriber and not missing, "reason": reason, "subscriber": subscriber,
+            "scopes_granted": scopes, "missing_scopes": missing}
+
+
+def t_health(p):
+    creds = load_creds()
+    if not creds.get("refresh_token"):
+        raise StravaError("Não autenticado. Rode: strava.py auth")
+    a = api_get("/athlete", creds=creds)
+    return {"status": "ok", "api_reachable": True, "athlete_id": a.get("id"), "rate_limit": dict(LAST_RATE)}
+
+
+def t_profile(p):
+    a = api_get("/athlete")
+
+    def gear(g):
+        return {"id": g.get("id"), "name": g.get("name"), "distance_km": round(g.get("distance", 0) / 1000, 1)}
+
+    return {
+        "id": a.get("id"), "username": a.get("username"),
+        "firstname": a.get("firstname"), "lastname": a.get("lastname"),
+        "city": a.get("city"), "state": a.get("state"), "country": a.get("country"),
+        "sex": a.get("sex"), "weight_kg": a.get("weight"), "ftp": a.get("ftp"),
+        "measurement_preference": a.get("measurement_preference"),
+        "subscriber": bool(a.get("summit") or a.get("premium")),
+        "created_at": a.get("created_at"), "bio": a.get("bio"),
+        "follower_count": a.get("follower_count"), "friend_count": a.get("friend_count"),
+        "bikes": [gear(g) for g in a.get("bikes") or []],
+        "shoes": [gear(g) for g in a.get("shoes") or []],
+    }
+
+
+def t_zones(p):
+    z = api_get("/athlete/zones")
+    return {"heart_rate": z.get("heart_rate"), "power": z.get("power")}
+
+
+def iso_bound(value, end=False):
+    if not value:
+        return None
+    s = str(value).strip()
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        raise StravaError(f"Data inválida: {s!r} (use ISO, ex.: 2026-09-01T00:00:00)")
+    if len(s) == 10 and end:
+        dt = dt.replace(hour=23, minute=59, second=59)
+    return dt.replace(tzinfo=None)
+
+
+def activity_item(a, polyline, tags):
+    speed = a.get("average_speed")
+    out = {
+        "id": a.get("id"), "name": a.get("name"), "sport_type": a.get("sport_type") or a.get("type"),
+        "start_date_local": a.get("start_date_local"),
+        "distance_m": a.get("distance"), "distance_km": round(a.get("distance", 0) / 1000, 2),
+        "moving_time_s": a.get("moving_time"), "elapsed_time_s": a.get("elapsed_time"),
+        "elevation_gain_m": a.get("total_elevation_gain"),
+        "average_speed_kmh": round(speed * 3.6, 2) if speed else None, "average_pace": fmt_pace(speed),
+        "max_speed_kmh": round(a["max_speed"] * 3.6, 2) if a.get("max_speed") else None,
+        "average_heartrate": a.get("average_heartrate"), "max_heartrate": a.get("max_heartrate"),
+        "average_watts": a.get("average_watts"),
+        "relative_effort": a.get("suffer_score"),
+        "kudos_count": a.get("kudos_count"), "achievement_count": a.get("achievement_count"),
+        "pr_count": a.get("pr_count"), "comment_count": a.get("comment_count"),
+    }
+    if polyline:
+        out["polyline"] = (a.get("map") or {}).get("summary_polyline")
+    if tags:
+        out.update({k: a.get(k) for k in ("commute", "trainer", "manual", "private", "workout_type", "gear_id")})
+    return out
+
+
+def t_list_activities(p):
+    start, end = iso_bound(p.get("range_start")), iso_bound(p.get("range_end"), end=True)
+    first = as_int(p, "first", 30)
+    ordering = p.get("ordering", "StartDateLocalDesc")
+    if ordering not in ("StartDateLocalDesc", "StartDateLocalAsc"):
+        raise StravaError("ordering deve ser StartDateLocalDesc ou StartDateLocalAsc")
+    desc = ordering == "StartDateLocalDesc"
+    try:
+        offset = int(p.get("after") or 0)
+    except ValueError:
+        raise StravaError("after deve ser o cursor retornado em page_info.end_cursor")
+    day = 86400
+    params = {
+        "after": int(start.replace(tzinfo=timezone.utc).timestamp()) - day if start else None,
+        "before": int(end.replace(tzinfo=timezone.utc).timestamp()) + day if end else None,
+    }
+    # a API devolve do mais antigo ao mais novo quando há "after"; caso contrário, do mais novo ao mais antigo
+    natural_desc = start is None
+    needed = offset + first + 1
+    creds, items, page = load_creds(), [], 1
+    while page <= 10:
+        batch = api_get("/athlete/activities", {**params, "page": page, "per_page": 200}, creds)
+        for a in batch:
+            local = (a.get("start_date_local") or "")[:19]
+            if (start and local < start.isoformat()) or (end and local > end.isoformat()):
+                continue
+            items.append(a)
+        page += 1
+        if len(batch) < 200 or (natural_desc == desc and len(items) >= needed):
+            break
+    items.sort(key=lambda a: a.get("start_date_local") or "", reverse=desc)
+    window = items[offset: offset + first]
+    has_next = len(items) > offset + first or (page <= 10 and natural_desc == desc and len(items) >= needed)
+    return {
+        "activities": [activity_item(a, as_bool(p.get("include_polyline")), as_bool(p.get("include_tags"))) for a in window],
+        "page_info": {"has_next_page": has_next, "end_cursor": str(offset + len(window)) if has_next else None},
+    }
+
+
+def t_performance(p):
+    aid = need(p, "activity_id")
+    a = api_get(f"/activities/{aid}", {"include_all_efforts": "true"})
+    try:
+        laps = api_get(f"/activities/{aid}/laps")
+    except StravaError as e:
+        if e.status != 404:
+            raise
+        laps = []
+    speed = a.get("average_speed")
+    return {
+        "id": a.get("id"), "name": a.get("name"), "sport_type": a.get("sport_type") or a.get("type"),
+        "start_date_local": a.get("start_date_local"), "description": a.get("description"),
+        "distance_m": a.get("distance"), "moving_time_s": a.get("moving_time"),
+        "elapsed_time_s": a.get("elapsed_time"), "elevation_gain_m": a.get("total_elevation_gain"),
+        "average_speed_kmh": round(speed * 3.6, 2) if speed else None, "average_pace": fmt_pace(speed),
+        "average_heartrate": a.get("average_heartrate"), "max_heartrate": a.get("max_heartrate"),
+        "average_watts": a.get("average_watts"), "weighted_average_watts": a.get("weighted_average_watts"),
+        "max_watts": a.get("max_watts"), "average_cadence": a.get("average_cadence"),
+        "calories": a.get("calories"), "kilojoules": a.get("kilojoules"),
+        "perceived_exertion": a.get("perceived_exertion"), "relative_effort": a.get("suffer_score"),
+        "pr_count": a.get("pr_count"), "achievement_count": a.get("achievement_count"),
+        "device_name": a.get("device_name"), "gear_id": a.get("gear_id"),
+        "segment_efforts": [
+            {k: s.get(k) for k in ("name", "distance", "elapsed_time", "moving_time", "pr_rank", "kom_rank",
+                                   "average_heartrate", "max_heartrate", "average_watts")} | {"segment_id": (s.get("segment") or {}).get("id")}
+            for s in a.get("segment_efforts") or []
+        ],
+        "best_efforts": [
+            {k: b.get(k) for k in ("name", "distance", "elapsed_time", "moving_time", "pr_rank")}
+            for b in a.get("best_efforts") or []
+        ],
+        "laps": [
+            {k: l.get(k) for k in ("lap_index", "name", "distance", "elapsed_time", "moving_time", "total_elevation_gain",
+                                   "average_speed", "average_heartrate", "max_heartrate", "average_cadence", "average_watts")}
+            for l in laps
+        ],
+    }
+
+
+def t_streams(p):
+    aid = need(p, "activity_id")
+    requested = p.get("streams") or DEFAULT_STREAMS.split(",")
+    if isinstance(requested, str):
+        requested = requested.split(",")
+    keys = [STREAM_ALIASES.get(k.strip(), k.strip()) for k in requested]
+    raw = api_get(f"/activities/{aid}/streams", {"keys": ",".join(keys), "key_by_type": "true"})
+    data = {k: v.get("data", []) for k, v in raw.items() if isinstance(v, dict)}
+    size = max((len(v) for v in data.values()), default=0)
+    resolution = as_int(p, "resolution", size or 1, lo=2, hi=100000) if p.get("resolution") else None
+    if resolution and size > resolution:
+        idx = [round(i * (size - 1) / (resolution - 1)) for i in range(resolution)]
+        data = {k: [v[i] for i in idx if i < len(v)] for k, v in data.items()}
+    return {"activity_id": aid, "original_points": size,
+            "returned_points": max((len(v) for v in data.values()), default=0), "streams": data}
+
+
+def t_gear(p):
+    types = p.get("gear_types") or ["Bike", "Shoe"]
+    if isinstance(types, str):
+        types = [types]
+    types = {t.capitalize() for t in types}
+    creds = load_creds()
+    athlete = api_get("/athlete", creds=creds)
+    ids = [g["id"] for g in (athlete.get("bikes") or []) + (athlete.get("shoes") or []) if g.get("id")]
+    if not ids:  # contas sem equipamento no perfil: descobrir pelos gear_id das atividades recentes
+        recent = api_get("/athlete/activities", {"per_page": 200}, creds)
+        ids = sorted({a["gear_id"] for a in recent if a.get("gear_id")})
+    out = []
+    for gid in ids:
+        gtype = GEAR_PREFIX_TYPE.get(gid[:1], "Unknown")
+        if gtype not in types:
+            continue
+        g = api_get(f"/gear/{gid}", creds=creds)
+        item = {"id": gid, "type": gtype, "name": g.get("name"), "primary": g.get("primary"),
+                "distance_m": g.get("distance"), "distance_km": round(g.get("distance", 0) / 1000, 1),
+                "retired": g.get("retired"), "brand_name": g.get("brand_name"), "model_name": g.get("model_name"),
+                "description": g.get("description")}
+        if gtype == "Bike":
+            item.update({"frame_type": g.get("frame_type"), "weight": g.get("weight")})
+        out.append(item)
+    return {"gear": out}
+
+
+def t_clubs(p):
+    first = as_int(p, "clubs_first", 10)
+    try:
+        offset = int(p.get("clubs_after") or 0)
+    except ValueError:
+        raise StravaError("clubs_after deve ser o cursor retornado em page_info.end_cursor")
+    creds = load_creds()
+    clubs = api_get("/athlete/clubs", {"per_page": 200}, creds)
+    window = clubs[offset: offset + first]
+    out = []
+    for c in window:
+        if c.get("member_count") is None:
+            c = {**c, **api_get(f"/clubs/{c['id']}", creds=creds)}
+        out.append({k: c.get(k) for k in ("id", "name", "sport_type", "city", "state", "country", "member_count", "private", "url")})
+    has_next = len(clubs) > offset + first
+    return {"clubs": out, "page_info": {"has_next_page": has_next, "end_cursor": str(offset + len(window)) if has_next else None}}
+
+
+TOOLS = {
+    "eligibility": (tool(t_eligibility, set()), "Verifica assinatura e escopos da conta"),
+    "health": (tool(t_health, set()), "Verifica credenciais e conectividade com a API"),
+    "get_athlete_profile": (tool(t_profile, set()), "Perfil do atleta"),
+    "list_activities": (tool(t_list_activities, {"range_start", "range_end", "first", "ordering", "include_polyline", "include_tags", "after"}),
+                        "Lista atividades (filtro de datas, ordenação, cursor)"),
+    "get_activity_performance": (tool(t_performance, {"activity_id"}), "Desempenho de uma atividade (FC, potência, voltas, segmentos)"),
+    "get_activity_streams": (tool(t_streams, {"activity_id", "streams", "resolution"}), "Séries temporais de uma atividade"),
+    "get_athlete_zones": (tool(t_zones, set(), {"as_of_date"}), "Zonas de FC e potência atuais"),
+    "get_gear": (tool(t_gear, {"gear_types"}), "Bikes e tênis"),
+    "get_club_info": (tool(t_clubs, {"clubs_first", "clubs_after"}, {"events_first"}), "Clubes do atleta"),
+}
+
+
 # ---------- CLI ----------
 
 def build_parser():
@@ -468,6 +779,12 @@ def build_parser():
     s = add("raw", cmd_raw, "GET em qualquer endpoint (ex.: /athlete/activities)")
     s.add_argument("path")
     s.add_argument("--param", action="append", help="k=v (repetível)")
+
+    for name, (fn, help_) in TOOLS.items():
+        sp = sub.add_parser(name, aliases=[name.replace("_", "-")], help=f"[ferramenta] {help_}")
+        sp.set_defaults(fn=fn)
+        sp.add_argument("--json", help="Parâmetros em JSON ('-' lê do stdin)")
+        sp.add_argument("--param", action="append", help="k=v (repetível; valor aceita JSON)")
     return p
 
 
